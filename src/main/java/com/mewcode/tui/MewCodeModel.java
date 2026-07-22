@@ -496,6 +496,9 @@ public class MewCodeModel implements Model {
             String protocol = selectedProvider.getProtocol();
 
             registry = ToolRegistry.createDefault();
+            registry.register(new com.mewcode.tool.impl.JavaBuildTool());
+            registry.register(new com.mewcode.tool.impl.JUnitRunTool());
+            registry.register(new com.mewcode.tool.impl.JavaDependencyTool());
 
             registry.register(new ToolSearchTool(registry, protocol));
             var exitPlanTool = new com.mewcode.tool.impl.ExitPlanModeTool();

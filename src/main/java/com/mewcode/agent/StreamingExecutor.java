@@ -168,6 +168,9 @@ public class StreamingExecutor {
 
         putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), output, result.isError(), elapsed));
 
+        com.mewcode.metrics.MetricsCollector.getInstance()
+                .recordToolCall(call.toolName(), (long)(elapsed * 1000), result.isError());
+
         // Post-tool hooks
         if (hookEngine != null) {
             var ctx = new HookEngine.HookContext(

@@ -202,6 +202,25 @@ public final class PromptSections {
         return new Section("TextOutput", 60, OUTPUT_EFFICIENCY_CONTENT);
     }
 
+    // ── Priority 55: Java ───────────────────────────────────────────────
+
+    static final String JAVA_CONTENT = """
+            # Java Development
+            When working on Java projects:
+             - Detect build system from project structure: pom.xml → Maven, build.gradle(.kts) → Gradle
+             - Use JavaBuild tool to compile before running tests
+             - Use JUnitRun tool to run specific tests with filter patterns
+             - Use JavaDependency tool to inspect dependencies before adding new ones
+             - Maven test filter format: "com.example.FooTest" or "com.example.FooTest#methodName"
+             - Gradle test filter format: "--tests com.example.FooTest.methodName"
+             - For compilation errors, fix all errors in a single pass — javac reports all errors at once
+             - Prefer ./gradlew over gradle command (uses project wrapper with correct version)
+             - Check if gradlew is executable: if not, run chmod +x gradlew first""";
+
+    public static Section javaSection() {
+        return new Section("Java", 55, JAVA_CONTENT);
+    }
+
     // ── Priority 70: Environment ────────────────────────────────────────
 
     public static Section environmentSection(EnvironmentContext env) {

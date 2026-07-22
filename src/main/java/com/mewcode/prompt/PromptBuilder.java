@@ -116,6 +116,7 @@ public class PromptBuilder {
         builder.add(PromptSections.usingToolsSection());
         builder.add(PromptSections.toneStyleSection());
         builder.add(PromptSections.outputEfficiencySection());
+        builder.add(PromptSections.javaSection());
         builder.add(PromptSections.environmentSection(env));
 
         if (options.skillSection() != null && !options.skillSection().isEmpty()) {

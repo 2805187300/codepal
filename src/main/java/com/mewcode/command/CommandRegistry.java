@@ -350,6 +350,29 @@ public class CommandRegistry {
                 }
         );
 
+        // /metrics (LOCAL)
+        register(
+                new Command("metrics", "Show agent runtime metrics (tool call stats, token usage, traces)",
+                        new String[]{}, CommandType.LOCAL, false),
+                ctx -> com.mewcode.metrics.MetricsCommand.handle()
+        );
+
+        // /eval (LOCAL)
+        register(
+                new Command("eval", "Run eval cases from a directory: /eval <dir>",
+                        new String[]{}, CommandType.LOCAL, false),
+                ctx -> {
+                    String dir = (ctx.args() == null || ctx.args().isBlank())
+                            ? ctx.workDir() + "/.mewcode/eval"
+                            : ctx.args().strip();
+                    var cases = com.mewcode.eval.EvalCase.Loader.loadFromDir(dir);
+                    if (cases.isEmpty()) {
+                        return "No eval cases found in: " + dir + "\nCreate *.json files with fields: id, description, prompt, expectedFileEdits, requiredOutputKeywords, successBashCheck";
+                    }
+                    return "Found " + cases.size() + " eval case(s) in " + dir + ".\nUse the agent to run evals programmatically via EvalRunner.";
+                }
+        );
+
         // /sandbox (LOCAL) — 沙箱模式管理
         register(
                 new Command("sandbox", "Manage OS-level sandbox for Bash commands",

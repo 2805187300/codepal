@@ -328,6 +328,8 @@ public class Agent {
             totalInput += turnInput;
             totalOutput += turnOutput;
             putSafe(queue, new AgentEvent.UsageEvent(totalInput, totalOutput));
+            com.mewcode.metrics.MetricsCollector.getInstance().recordTokens(turnInput, turnOutput);
+            com.mewcode.metrics.MetricsCollector.getInstance().recordTurnComplete();
 
             // Max tokens handling
             if ("max_tokens".equals(stopReason)) {

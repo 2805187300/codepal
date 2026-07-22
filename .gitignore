@@ -1,8 +1,10 @@
 build/
 .gradle/
 *.jar
+*.class
 .idea/
 *.iml
 out/
-.mewcode/
+.DS_Store
+.codepal/
 CLAUDE.md

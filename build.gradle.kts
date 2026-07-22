@@ -6,12 +6,12 @@ plugins {
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
+        languageVersion = JavaLanguageVersion.of(21)
     }
 }
 
 application {
-    mainClass = "com.mewcode.MewCode"
+    mainClass = "com.codepal.CodePal"
 }
 
 repositories {
@@ -54,7 +54,7 @@ tasks.test {
 }
 
 tasks.shadowJar {
-    archiveBaseName = "mewcode"
+    archiveBaseName = "codepal"
     archiveClassifier = ""
     archiveVersion = ""
     mergeServiceFiles()

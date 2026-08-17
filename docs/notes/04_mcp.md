@@ -91,4 +91,115 @@ registry.markDiscovered(name);
 
 ---
 
+## 7. MCP 两种传输协议详解
+
+MCP 协议定义了客户端（Agent）和工具服务端之间的通信规范，传输层有两种实现。
+
+### Stdio 传输
+
+客户端把 MCP Server 作为**子进程**启动，双方通过 stdin/stdout 通信，消息格式是 JSON-RPC 2.0。
+
+```
+CodePal（父进程）
+    ↓ fork 子进程
+MCP Server（如 npx @modelcontextprotocol/server-github）
+    ↑↓ stdin / stdout 传 JSON-RPC 消息
+```
+
+配置示例：
+```yaml
+mcpServers:
+  - name: github
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+```
+
+代码路径（`McpManager.java` 第 86-98 行）：
+```java
+var paramsBuilder = ServerParameters.builder(windowsSafe(cfg.getCommand()));
+paramsBuilder.args(cfg.getArgs());
+paramsBuilder.env(resolvedEnv);
+transport = new StdioClientTransport(paramsBuilder.build(), ...);
+```
+
+三个细节：
+
+**① 环境变量插值**：配置里写 `${GITHUB_TOKEN}`，`resolveEnvVars()` 用正则 `\$\{([^}]+)\}` 匹配，从 `System.getenv()` 取真实值替换，token 不用硬编码进配置文件。
+
+**② Windows 兼容**（`windowsSafe()` 第 122-127 行）：`npx`、`node`、`uvx` 等命令在 Windows 上必须加 `.cmd` 后缀才能被 PATH 找到，检测到 Windows 时自动补全。
+
+**③ 进程生命周期**：子进程跟随父进程，`shutdown()` 时调 `closeGracefully()` 发送 close 通知，子进程自行退出。
+
+适用场景：本地 npm/uvx 包、本地二进制，无网络依赖，延迟极低。
+
+---
+
+### Streamable HTTP 传输
+
+MCP Server 是独立 HTTP 服务，客户端通过 HTTP POST 通信（JSON-RPC body），这是 MCP 2025 年规范更新的新版传输，取代了旧版 SSE。
+
+```
+CodePal
+    ↓ HTTP POST（JSON-RPC body）
+Remote MCP Server（独立进程/云服务）
+    ↑ HTTP Response 或 SSE stream
+```
+
+配置示例：
+```yaml
+mcpServers:
+  - name: my-remote-tool
+    url: https://mcp.example.com/v1
+    headers:
+      Authorization: Bearer ${API_KEY}
+      X-Tenant-Id: my-org
+```
+
+代码路径（`McpManager.java` 第 99-108 行）：
+```java
+var httpBuilder = HttpClientStreamableHttpTransport.builder(cfg.getUrl());
+httpBuilder.customizeRequest(rb -> {
+    for (var e : cfg.getHeaders().entrySet()) {
+        rb.header(e.getKey(), resolveEnvVars(e.getValue())); // 同样支持变量插值
+    }
+});
+transport = httpBuilder.build();
+```
+
+`customizeRequest` 是每次发 HTTP 请求前执行的 lambda，动态注入 headers，认证 token 同样支持 `${VAR}` 插值。
+
+适用场景：托管在云上的 MCP 服务、企业内部工具平台、多 Agent 共享的工具服务。
+
+---
+
+### 两种传输对比
+
+| | Stdio | Streamable HTTP |
+|--|-------|-----------------|
+| Server 位置 | 本地子进程 | 远程独立服务 |
+| 启动方式 | 父进程 fork | 已运行，直连 |
+| 通信方式 | stdin/stdout | HTTP POST |
+| 认证 | 环境变量传给子进程 | HTTP headers |
+| 延迟 | 极低（进程内） | 网络延迟 |
+| 适合 | npm/uvx 本地包 | 云服务、企业平台 |
+
+---
+
+### 传输无关性：统一抽象的好处
+
+两种传输都实现 `McpClientTransport` 接口，`McpSyncClient` 完全不感知底层用哪种。`McpToolWrapper` 只持有一个 client，执行时调 `client.callTool()`，无论 stdio 还是 HTTP 接口完全一致：
+
+```java
+@Override public ToolResult execute(Map<String, Object> args) {
+    var result = client.callTool(new McpSchema.CallToolRequest(sdkTool.name(), args));
+    // 这一行对 stdio 和 HTTP 完全一样
+}
+```
+
+这就是 MCP 协议传输无关性设计的价值——工具实现者和工具使用者都不需要关心底层通信方式。
+
+---
+
 *下一模块：五层权限安全隔离（PermissionChecker.java）*

@@ -371,4 +371,132 @@ for (var tool : tools.values()) {
 
 ---
 
+---
+
+## 9. 补充问答：LLM 工具调用的本质 & Agent Loop 原理
+
+**Q：LLM 调用工具靠的是什么？是 prompt 吗？**
+
+> 是的，核心就是 prompt，但比普通对话 prompt 复杂得多。
+>
+> LLM 本身不会"执行"任何东西。它只做两件事：读 prompt，输出文本。工具调用的关键在于 Anthropic 在训练时让模型学会了"如果需要用工具，就输出这样格式的 JSON"：
+>
+> ```json
+> { "type": "tool_use", "name": "ReadFile", "input": { "file_path": "/src/UserService.java" } }
+> ```
+>
+> 这不是魔法，就是训练出来的输出格式约定。框架（harness）的工作是：解析这个 JSON → 真正调用对应的代码 → 把结果以 `tool_result` 格式追加回对话历史 → 带着新历史再调一次 LLM → 循环。**LLM 从来不执行任何东西，执行的是框架代码。**
+
+**Q：ToolSearch 也是一个工具吗？**
+
+> 是的，ToolSearch 本身就是注册在 ToolRegistry 里的普通工具，`shouldDefer()` 返回 `false`（核心工具，每轮都注入）。它的特殊之处在于用途：它是"元工具"，用来解锁其他延迟加载的工具。LLM 用 ToolSearch 这个工具，去查其他 MCP 工具的 schema。
+
+**Q：这个项目用了什么框架？为什么工具会被自动调用？**
+
+> 没有用任何框架，Agent Loop 是纯手写的（`Agent.java` 的 `agentLoop()` 方法）。整个机制由三步拼成：
+>
+> **① 注册**：所有工具（包括 MCP 工具、Skill 工具）统一注册到 `ToolRegistry`：
+> ```java
+> registry.register(new ReadFileTool());
+> registry.register(new McpToolWrapper(...));  // MCP 工具
+> registry.register(new SkillTool(...));       // Skill 工具
+> ```
+>
+> **② schema 注入给 LLM**：每轮循环取出所有工具的 JSON schema 发给 API：
+> ```java
+> var tools = registry.getAllSchemas(protocol);
+> client.stream(conv, tools);  // 带着 schema 发给 Anthropic API
+> ```
+>
+> **③ 解析执行**：收到 LLM 输出的 `tool_use` JSON 后，`StreamingExecutor` 按名字从 registry 找到对应 `Tool` 实现，调用 `execute()`，把结果追加历史，继续下一轮。
+>
+> MCP 工具、Skill 工具、普通工具全都实现同一个 `Tool` 接口，统一注册、统一调用，Agent Loop 完全不感知区别。
+
+**Q：整个 Agent Loop 的结构是什么样的？**
+
+> `Agent.java` 的 `agentLoop()` 是一个 `for` 无限循环，每轮：
+> ```
+> ① getAllSchemas() 准备工具列表
+> ② 注入 system reminder（deferred 工具名、记忆、plan 模式提示）
+> ③ 两层上下文压缩检查
+> ④ client.stream(conv, tools) 发请求给 LLM
+> ⑤ 消费流式事件（文本增量、工具调用）
+> ⑥ if (没有工具调用) → break，任务结束
+> ⑦ executor.executeAll(toolCalls) 真正执行工具
+> ⑧ conv.addToolResultsMessage(results) 把结果追加对话历史
+> ⑨ 继续下一轮
+> ```
+>
+> 用 Java 21 虚拟线程（`Thread.startVirtualThread`）运行，事件通过 `BlockingQueue<AgentEvent>` 传给 TUI 实时渲染。
+
+---
+
+## 10. 补充问答：子 Agent 的实现原理
+
+**Q：子 Agent 是怎么实现的？**
+
+> 子 Agent 本质就是一个实现了 `Tool` 接口的工具（`AgentTool`），注册在 `ToolRegistry` 里，名字叫 `"Agent"`。父 Agent 调它和调 `ReadFile` 没有任何区别——LLM 输出一个 `tool_use`，框架解析后调 `AgentTool.execute()`。
+>
+> ```
+> 父 Agent LLM 输出：
+> { "type": "tool_use", "name": "Agent", "input": { "description": "...", "prompt": "..." } }
+>          ↓
+> AgentTool.execute() 被调用
+>          ↓
+> 创建全新的 Agent 实例 + 全新的 ConversationManager
+>          ↓
+> subAgent.run(conv) 跑起来（在虚拟线程里）
+>          ↓
+> 等待子 Agent 的 LoopComplete 事件
+>          ↓
+> 把子 Agent 的最终输出文本 return 给父 Agent 作为工具结果
+> ```
+
+**Q：Agent 实例是在哪里创建的？**
+
+> 三种模式各自的创建位置：
+>
+> - **`runSync()`**（`AgentTool.java:377`）：直接 `new Agent()`，当前线程阻塞等结果
+> - **`runAsync()`**（第 303 行）：委托给 `taskManager.spawnSubAgent()`，内部 `new Agent()`，后台跑
+> - **`runFork()`**（第 337 行）：委托给 `taskManager.spawnForkAgent()`，内部 `new Agent()`，后台跑
+> - **`runAsTeammate()`**（第 544 行）：委托给 `SpawnDispatcher.spawnTeammate()`，内部创建
+>
+> `runSync` 是最直接的，Agent 实例就在方法里 new 出来；其余三种都是把参数传给各自的管理器，由管理器在后台线程里创建。
+
+**Q：子 Agent 的工具怎么隔离？**
+
+> `ToolFilter.filterForAgent(parentRegistry, spec)` 按 spec 定义过滤工具，子 Agent 拿到的是一个裁剪过的 `ToolRegistry`：
+>
+> ```java
+> ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec);
+> Agent subAgent = new Agent(subClient, subRegistry, protocol, providerConfig);
+> ```
+>
+> 比如 `explore` 类型子 Agent 只有只读工具（ReadFile、Grep、Glob），没有 Write、Bash——完全靠 spec 配置控制，不是硬编码。
+
+**Q：Fork 模式继承父 Agent 历史记忆是怎么实现的？**
+
+> 就是消息列表的复制。`buildForkedConversation()` 把父 Agent 的 `ConversationManager` 消息列表逐条 copy 到子 Agent 的新 `ConversationManager` 里：
+>
+> ```java
+> ConversationManager forked = new ConversationManager();
+> for (var msg : parent.getMessages()) {
+>     // 把父 Agent 的每条消息原样复制进来
+> }
+> forked.addUserMessage(FORK_BOILERPLATE + "\n\nYour task:\n" + task);
+> ```
+>
+> 子 Agent 发请求时带着这份历史，LLM 就能"看到"父 Agent 之前做了什么。
+>
+> 唯一特殊处理的是"未完成的 tool_use"——fork 时父 Agent 可能有个工具调到一半，必须补一个占位 `tool_result`，否则触发配对约束导致 API 400：
+>
+> ```java
+> // 父 Agent 有 tool_use 但还没有 tool_result（被 fork 打断了）
+> var placeholders = msg.getToolUses().stream()
+>         .map(tu -> new ToolResultBlock(tu.toolUseId(),
+>                 "(tool execution interrupted by fork)", false))
+>         .toList();
+> forked.addToolResultsMessage(placeholders);
+> ```
+
 *（本文档随学习对话持续更新）*

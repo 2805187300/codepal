@@ -366,9 +366,16 @@ while (keepStart > 0 && isToolResultMessage(messages.get(keepStart))) {
 
 **Q6：落盘的工具结果文件，什么时候清理？会不会一直堆积占用磁盘？**
 
-> 当前实现是会话结束后、或触发第二层摘要时一并清理——一旦旧历史被摘要替换，对应的落盘文件在对话里已没有指针，可以安全删除。没有触发摘要时文件会存到会话结束。
+> 代码里没有主动清理落盘文件的逻辑，文件会持久存在于 `.codepal/tool_results/` 直到用户手动清理。Session 文件（`.codepal/sessions/*.jsonl`）有 30 天过期自动清理，但落盘文件没有类似机制。这是一个改进点。
 >
-> 这是取舍：频繁清理增加 I/O，懒清理短暂占磁盘。Agent 一次会话的中间文件总量通常几十 MB，可以接受。如果有严格的磁盘要求，可以加 LRU 容量限制。
+> **追问：那落盘文件消失了，恢复历史对话不就丢内容了吗？**
+>
+> 不会，因为落盘文件和历史恢复是两套完全独立的机制：
+>
+> - **历史恢复**靠 `.jsonl` session 文件 + `compact_boundary` 摘要重建，`SessionManager.rebuildConversation()` 只读 session 文件，不依赖落盘文件
+> - **落盘文件**存的是超大工具结果的原始内容，对话历史里只留了一个指针字符串：`[Result of 18432 chars saved to .codepal/tool_results/call_abc123]`
+>
+> 恢复会话时，这个指针字符串原样重建进对话，LLM 能看到"这里曾有个大结果被落盘"，但读不到原始内容——这是**有意识的取舍**：落盘的目的是"释放这轮 Token 压力"，不是"永久存储"。超大工具结果（比如读了 3000 行文件的返回值）在 Agent 完成那步之后几乎不会再用到；真正需要跨会话保留的关键信息，靠摘要机制提炼进 `compact_boundary`，不靠原始结果文件。
 
 **Q7：Token 数用字符数估算，精度够吗？会不会因为偏差导致提前或推迟触发？**
 
@@ -508,5 +515,84 @@ while (keepStart > 0 && isToolResultMessage(messages.get(keepStart))) {
 > **两层渐进式上下文压缩**：第一层超大工具结果即时落盘只留引用指针，第二层接近上限时调 LLM 生成结构化摘要替换历史，压缩边界严格对齐 tool_use / tool_result 配对约束以避免 API 400 错误；单次会话可持续数小时不中断，Token 成本较无压缩方案显著降低。
 
 ---
+
+---
+
+## 9. 补充问答：MESSAGE_AGGREGATE_LIMIT 与字符预估
+
+**Q：`MESSAGE_AGGREGATE_LIMIT` 是什么场景下触发的？**
+
+> 一条 `tool_result` 消息里可以包含**多个工具结果**——当 Agent 同一轮并发调用了多个工具（`StreamingExecutor` 批量执行），它们的结果会被打包进同一条消息。每个单条结果没超 50,000，但加在一起可能很大：
+>
+> ```
+> 一轮并发调用：
+>   ReadFile(A) → 30,000 字符   ← 单条不超 50,000，不触发单条落盘
+>   ReadFile(B) → 30,000 字符
+>   ReadFile(C) → 30,000 字符
+>   ReadFile(D) → 30,000 字符
+>   ReadFile(E) → 30,000 字符
+>   ReadFile(F) → 60,000 字符   ← 这条会先被单条落盘
+>   聚合总量 = 210,000 字符      ← 超过 200,000，触发聚合落盘
+> ```
+>
+> 触发聚合落盘后，阈值更激进——超过 200 字符的结果都落盘（而不是单条的 50,000 门槛），整条消息里几乎所有结果都被替换成指针。
+>
+> 代码逻辑（`offloadAndSnip`）是两次扫描：先按单条触发，再算聚合总量，两个条件独立判断：
+>
+> ```java
+> // 第一遍：单条超 50,000 → 落盘
+> if (safeLength(tr.content()) > SINGLE_RESULT_LIMIT) { writeSpill(...) }
+>
+> // 第二遍：聚合超 200,000 → 对该消息里剩余所有 >200 字符的结果落盘
+> if (agg > MESSAGE_AGGREGATE_LIMIT) {
+>     if (safeLength(tr.content()) > 200) { writeSpill(...) }
+> }
+> ```
+
+**Q：字符数是怎么预估成 Token 数的？**
+
+> 两个地方用途不同，方法也不同：
+>
+> **落盘触发判断**（`offloadAndSnip` 里的 `safeLength`）：直接用 Java 字符串长度，不换算，简单快：
+> ```java
+> private static int safeLength(String s) {
+>     return s == null ? 0 : s.length();  // 就是字符数，没有任何转换
+> }
+> ```
+>
+> **Token 总量估算**（`estimateTokens` 里）：用 `/3.5` 换算成 Token 数，给软/硬触发线做判断：
+> ```java
+> total += (int) (safeLength(m.getContent()) / 3.5) + 4;
+> total += (int) (safeLength(tr.content()) / 3.5) + 10;
+> ```
+>
+> 3.5 是折中经验值：英文约 4 字符一个 Token，中文约 1.5 字符一个 Token，混合文本取 3.5。精度约 ±15%，但触发阈值设了足够大的安全边距（软触发留 13,000 Token 余量），误差不影响正确性。
+
+**Q：估算不准确怎么办？误差会不会累积导致提前或延迟触发？**
+
+> 纯字符估算有两个问题：误差随轮数累积越来越大；有 Prompt Cache 命中时，API 实际计费的 input tokens 远小于字符估算值，会导致严重高估、提前误触发压缩。
+>
+> 解决方案是 **UsageAnchor 机制**——每轮 API 调用结束后，用 API 返回的真实 token 数作为新的基准锚点：
+>
+> ```java
+> // Agent.java — 每轮 stream 结束后
+> conv.recordUsageAnchor(turnInput, turnOutput, turnCacheRead, turnCacheCreation);
+> // baselineTokens = input + cacheRead + cacheCreation + output（API 真实值）
+> ```
+>
+> 然后 `currentTokens()` 的计算变成"锚点之前用真实值 + 锚点之后只估算增量"：
+>
+> ```java
+> public static int currentTokens(List<Message> messages, UsageAnchor anchor) {
+>     if (anchor == null) {
+>         return estimateTokens(messages);  // 冷启动，全量估算
+>     }
+>     // 锚点之后新增的消息才需要估算，增量小误差可控
+>     List<Message> appended = messages.subList(anchor.anchorCount(), messages.size());
+>     return anchor.baselineTokens() + estimateTokens(appended);
+> }
+> ```
+>
+> 效果：每轮之后误差归零重置，不再累积。即使有 Cache 命中，锚点也反映了真实的 token 消耗，不会提前误触发。字符估算只用于锚点之后的新增消息（增量通常很小），误差始终在可控范围内。
 
 *（本文档随学习对话持续更新）*

@@ -387,4 +387,66 @@ TMUX 模式的好处：每个 Teammate 有独立的终端窗格，可以实时�
 
 ---
 
+---
+
+## 10. 补充问答：FileMailBox 与文件冲突
+
+**Q：FileMailBox 是自己实现的还是已有的中间件？**
+
+> 完全自己实现，没有用任何消息队列中间件。整个 `FileMailBox.java` 只用了两个依赖：
+> - **Jackson**（`ObjectMapper`）— 序列化/反序列化 JSON，项目本来就有的通用依赖
+> - **Java NIO**（`java.nio.file.*`）— 文件读写，JDK 标准库
+>
+> 文件锁、随机退避、陈旧锁检测、消息格式全是手写的。这是一个设计亮点：**在不引入任何额外基础设施依赖的前提下，用文件系统实现了跨进程异步消息队列**，部署零成本，调试直接 `cat` 文件查看消息，对 Agent 框架这种低频通信场景完全够用。
+
+**Q：多 Agent 并行修改代码，不会有文件冲突吗？**
+
+> 不会，因为每个 Teammate 在**独立的 git worktree** 里工作，物理路径完全不同：
+>
+> ```bash
+> git worktree add .codepal/teams/team1/worktrees/teammate-1 -b teammate-1-branch
+> git worktree add .codepal/teams/team1/worktrees/teammate-2 -b teammate-2-branch
+> ```
+>
+> Teammate-1 修改的是 `worktrees/teammate-1/UserService.java`，Teammate-2 修改的是 `worktrees/teammate-2/OrderService.java`——文件系统层面完全隔离，根本不存在同时写同一个文件的情况。
+>
+> 冲突风险转移到了合并阶段，但 Lead 在任务分解时就会从源头规避：
+> ```
+> Lead 分配原则：
+>   把同一个文件的所有改动分给同一个 Teammate
+>   → Teammate-1 负责所有涉及 UserService.java 的改动
+>   → Teammate-2 负责所有涉及 OrderService.java 的改动
+>   → 不同 Teammate 的修改文件集合尽量不重叠
+> ```
+>
+> 如果真的有两个 Teammate 改了同一个文件的同一行，合并时才需要人工介入——这是 Lead 任务分解失误导致的，不是架构本身的问题。
+
+**Q：Lead 是怎么分任务的？分任务之前它怎么知道不会冲突？**
+
+> 项目里没有任何自动分析文件冲突的代码逻辑。Lead 怎么分任务、分给谁、分哪些文件——完全由 LLM 自己判断，框架只提供工具（`TeamCreate`、`Agent(team_name=...)`、`SendMessage`）和一句 prompt 指引。
+>
+> Lead 的实际流程是：先用 `ReadFile`/`Glob`/`Grep` 分析项目结构，理解哪些文件需要改动、改动之间是否有依赖，然后自己判断如何分配——"这三个类互相独立，可以并行；这两个类共享同一个接口，改动要给同一个 Teammate"。
+>
+> 这不是硬编码规则，是 LLM 读懂代码结构后的语义推理。优点是灵活，能理解规则代码无法表达的隐性依赖；缺点是不可靠，LLM 可能判断失误。这是有损优化——框架提供隔离机制（worktree），冲突规避依赖 LLM 的判断质量。
+
+**Q：真的发生冲突了怎么处理？**
+
+> 没有自动合并机制，由 Lead（LLM）在验证阶段处理。`Coordinator.java` 里定义了四阶段工作流：
+>
+> ```
+> 1. Research       — Lead 探索问题空间
+> 2. Synthesis      — Lead 制定计划、分解任务
+> 3. Implementation — Lead 派发 Teammate 执行
+> 4. Verification   — Lead 验证结果、解决冲突
+> ```
+>
+> 第 4 阶段的具体流程：
+> 1. 所有 Teammate 完成后发 `[idle]` 消息通知 Lead
+> 2. Lead 用 `Bash` 执行 `git merge` 合并各 Teammate 的 branch
+> 3. 有冲突时 `git merge` 输出冲突标记（`<<<<<<<`/`=======`/`>>>>>>>`），Lead 读到冲突内容
+> 4. Lead 用 `ReadFile`/`EditFile` 分析冲突，选择保留哪一方或手动合并两份改动
+> 5. 验证编译和测试通过
+>
+> Coordinator 模式下 Lead 的工具被限制为协调类工具（`ReadFile`、`Bash`、`SendMessage` 等），`Bash` 覆盖了 `git merge`，`EditFile` 覆盖了冲突编辑——和人工解决冲突的操作完全一样，只是执行者换成了 LLM。
+
 *（本文档随学习对话持续更新）*
